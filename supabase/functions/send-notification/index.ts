@@ -1,11 +1,12 @@
-// Admin-only: creates a notification, fans it out to recipient rows (all users or one user),
-// and sends a real Expo push to each recipient's stored push_token.
+// Admin-only: creates a notification, fans it out to recipient rows (all users, one user, or a
+// selected list of users), and sends a real Expo push to each recipient's stored push_token.
 // Deploy via Supabase Dashboard -> Edge Functions -> New Function -> paste this file -> Deploy.
 //
 // Call with:
 //   Authorization: Bearer <admin's access token>
 //   { "title": "...", "body": "...", "target": "all" }
 //   { "title": "...", "body": "...", "target": "user", "targetUserId": "<uuid>" }
+//   { "title": "...", "body": "...", "target": "selected", "targetUserIds": ["<uuid>", ...] }
 // Optional: "storyId": "<uuid>" to deep-link the notification to a story.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -59,10 +60,10 @@ Deno.serve(async (req: Request) => {
     }
 
     const payload = await req.json().catch(() => null);
-    const { title, body, target, targetUserId, storyId } = payload ?? {};
-    if (!title || !body || (target !== "all" && target !== "user")) {
+    const { title, body, target, targetUserId, targetUserIds, storyId } = payload ?? {};
+    if (!title || !body || (target !== "all" && target !== "user" && target !== "selected")) {
       return new Response(
-        JSON.stringify({ error: "Required: title, body, target ('all' or 'user')" }),
+        JSON.stringify({ error: "Required: title, body, target ('all', 'user', or 'selected')" }),
         { status: 400, headers: jsonHeaders }
       );
     }
@@ -71,6 +72,12 @@ Deno.serve(async (req: Request) => {
         status: 400,
         headers: jsonHeaders,
       });
+    }
+    if (target === "selected" && (!Array.isArray(targetUserIds) || targetUserIds.length === 0)) {
+      return new Response(
+        JSON.stringify({ error: "targetUserIds (non-empty array) is required when target is 'selected'" }),
+        { status: 400, headers: jsonHeaders }
+      );
     }
 
     const { data: notification, error: insertError } = await adminClient
@@ -95,6 +102,8 @@ Deno.serve(async (req: Request) => {
     let recipientQuery = adminClient.from("profiles").select("id, push_token");
     if (target === "user") {
       recipientQuery = recipientQuery.eq("id", targetUserId);
+    } else if (target === "selected") {
+      recipientQuery = recipientQuery.in("id", targetUserIds);
     }
     const { data: recipients, error: recipientsError } = await recipientQuery;
     if (recipientsError) {
