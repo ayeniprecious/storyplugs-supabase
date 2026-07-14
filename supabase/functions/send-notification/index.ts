@@ -7,7 +7,10 @@
 //   { "title": "...", "body": "...", "target": "all" }
 //   { "title": "...", "body": "...", "target": "user", "targetUserId": "<uuid>" }
 //   { "title": "...", "body": "...", "target": "selected", "targetUserIds": ["<uuid>", ...] }
-// Optional: "storyId": "<uuid>" to deep-link the notification to a story.
+// Optional: "storyId": "<uuid>" to deep-link the notification to a single story.
+// Optional: "storyIds": ["<uuid>", ...] to attach an ordered list of stories instead
+// (rendered as a ranked poster row in the app) -- the two are independent, a
+// notification can carry either, both, or neither.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -60,7 +63,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const payload = await req.json().catch(() => null);
-    const { title, body, target, targetUserId, targetUserIds, storyId } = payload ?? {};
+    const { title, body, target, targetUserId, targetUserIds, storyId, storyIds } = payload ?? {};
     if (!title || !body || (target !== "all" && target !== "user" && target !== "selected")) {
       return new Response(
         JSON.stringify({ error: "Required: title, body, target ('all', 'user', or 'selected')" }),
@@ -99,6 +102,21 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    if (Array.isArray(storyIds) && storyIds.length > 0) {
+      const storyRows = storyIds.map((sid: string, index: number) => ({
+        notification_id: notification.id,
+        story_id: sid,
+        sort_order: index,
+      }));
+      const { error: storiesError } = await adminClient.from("notification_stories").insert(storyRows);
+      if (storiesError) {
+        return new Response(JSON.stringify({ error: storiesError.message }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
+    }
+
     let recipientQuery = adminClient.from("profiles").select("id, push_token");
     if (target === "user") {
       recipientQuery = recipientQuery.eq("id", targetUserId);
@@ -131,7 +149,7 @@ Deno.serve(async (req: Request) => {
         to,
         title,
         body,
-        data: { storyId: storyId ?? null, notificationId: notification.id },
+        data: { storyId: storyId ?? null, storyIds: storyIds ?? null, notificationId: notification.id },
       }));
       const res = await fetch(EXPO_PUSH_URL, {
         method: "POST",
