@@ -1,13 +1,25 @@
 // Deletes the calling user's own account. Must run server-side: it needs the service_role key
 // to call auth.admin.deleteUser, which a client app can never safely hold.
 // Deploy via Supabase Dashboard -> Edge Functions -> New Function -> paste this file -> Deploy.
+// Turn OFF "Verify JWT" for this function in the dashboard -- this handler already authenticates
+// the caller manually from their own JWT below, and the platform's Verify JWT gate rejects the
+// browser's CORS preflight (OPTIONS never carries an Authorization header) before this code even
+// runs, which is what was breaking every call from the web/app client.
 // SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY are auto-provided by the platform.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const jsonHeaders = { "Content-Type": "application/json" };
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+const jsonHeaders = { "Content-Type": "application/json", ...corsHeaders };
 
 Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
