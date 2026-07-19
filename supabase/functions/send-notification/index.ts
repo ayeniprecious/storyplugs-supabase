@@ -117,33 +117,56 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    let recipientQuery = adminClient.from("profiles").select("id, push_token");
-    if (target === "user") {
-      recipientQuery = recipientQuery.eq("id", targetUserId);
-    } else if (target === "selected") {
-      recipientQuery = recipientQuery.in("id", targetUserIds);
-    }
-    const { data: recipients, error: recipientsError } = await recipientQuery;
-    if (recipientsError) {
-      return new Response(JSON.stringify({ error: recipientsError.message }), {
-        status: 500,
-        headers: jsonHeaders,
-      });
+    // Supabase caps an unpaginated .select() at 1000 rows by default -- for "all" this
+    // must scale to the entire user base, so page through every row explicitly rather
+    // than trusting a single request to return everyone.
+    const PAGE_SIZE = 1000;
+    const recipients: { id: string; push_token: string | null }[] = [];
+    for (let from = 0; ; from += PAGE_SIZE) {
+      let pageQuery = adminClient.from("profiles").select("id, push_token").range(from, from + PAGE_SIZE - 1);
+      if (target === "user") {
+        pageQuery = pageQuery.eq("id", targetUserId);
+      } else if (target === "selected") {
+        pageQuery = pageQuery.in("id", targetUserIds);
+      }
+      const { data: page, error: pageError } = await pageQuery;
+      if (pageError) {
+        return new Response(JSON.stringify({ error: pageError.message }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
+      recipients.push(...(page ?? []));
+      if (!page || page.length < PAGE_SIZE) break;
     }
 
-    const recipientRows = (recipients ?? []).map((r) => ({
+    const recipientRows = recipients.map((r) => ({
       notification_id: notification.id,
       user_id: r.id,
     }));
-    if (recipientRows.length > 0) {
-      await adminClient.from("notification_recipients").insert(recipientRows);
+    for (let i = 0; i < recipientRows.length; i += PAGE_SIZE) {
+      const { error: recipientsInsertError } = await adminClient
+        .from("notification_recipients")
+        .insert(recipientRows.slice(i, i + PAGE_SIZE));
+      if (recipientsInsertError) {
+        return new Response(JSON.stringify({ error: recipientsInsertError.message }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
     }
 
-    const pushTokens = (recipients ?? [])
+    const pushTokens = recipients
       .map((r) => r.push_token)
       .filter((token): token is string => !!token && token.startsWith("ExponentPushToken"));
 
+    // A 200 from Expo's API only means the batch was accepted for processing --
+    // each individual push still gets its own "ticket" in the response body,
+    // and THAT is where real per-recipient failures (bad credentials, revoked
+    // token, etc.) actually show up. Checking res.ok alone was silently
+    // hiding delivery failures.
     let pushSent = 0;
+    const pushErrors: unknown[] = [];
     for (let i = 0; i < pushTokens.length; i += 100) {
       const batch = pushTokens.slice(i, i + 100).map((to) => ({
         to,
@@ -156,11 +179,24 @@ Deno.serve(async (req: Request) => {
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify(batch),
       });
-      if (res.ok) pushSent += batch.length;
+      const resBody = await res.json().catch(() => null);
+      const tickets = Array.isArray(resBody?.data) ? resBody.data : [];
+      for (const ticket of tickets) {
+        if (ticket?.status === "ok") pushSent += 1;
+        else pushErrors.push(ticket);
+      }
+      if (tickets.length === 0 && !res.ok) {
+        pushErrors.push({ httpStatus: res.status, body: resBody });
+      }
     }
 
     return new Response(
-      JSON.stringify({ success: true, recipientCount: recipientRows.length, pushSent }),
+      JSON.stringify({
+        success: true,
+        recipientCount: recipientRows.length,
+        pushSent,
+        pushErrors: pushErrors.length > 0 ? pushErrors : undefined,
+      }),
       { status: 200, headers: jsonHeaders }
     );
   } catch (e) {
