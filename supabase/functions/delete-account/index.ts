@@ -55,6 +55,26 @@ Deno.serve(async (req: Request) => {
     }
 
     const adminClient = createClient(supabaseUrl, serviceRoleKey);
+
+    // Snapshot the account before it's gone -- deleteUser() cascades and
+    // wipes the profiles row, so this is the last point admins can be told
+    // who this was. Best-effort: a lookup/notify failure here must never
+    // block the deletion itself.
+    try {
+      const { data: profile } = await adminClient
+        .from("profiles")
+        .select("display_name, date_of_birth")
+        .eq("id", userData.user.id)
+        .single();
+      await adminClient.rpc("notify_admins_on_account_deletion", {
+        p_display_name: profile?.display_name ?? null,
+        p_email: userData.user.email ?? null,
+        p_date_of_birth: profile?.date_of_birth ?? null,
+      });
+    } catch (_notifyError) {
+      // Deletion proceeds regardless.
+    }
+
     const { error: deleteError } = await adminClient.auth.admin.deleteUser(userData.user.id);
     if (deleteError) {
       return new Response(JSON.stringify({ error: deleteError.message }), {
